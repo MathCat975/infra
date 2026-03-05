@@ -6,9 +6,11 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"strings"
+	"os"
 	"sync"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 type CacheEntry struct {
@@ -16,9 +18,12 @@ type CacheEntry struct {
 	expiresAt time.Time
 }
 
+type Config struct {
+	Servers []string `yaml:"servers"`
+}
+
 var (
-	port     int
-	backends string
+	port     = 8080
 	timeout  int
 	cacheTTL int
 )
@@ -29,6 +34,23 @@ var backendMu sync.Mutex
 
 var cache = map[string]CacheEntry{}
 var cacheMu sync.Mutex
+
+func loadConfig(path string) Config {
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		log.Fatal("cannot read config:", err)
+	}
+
+	var cfg Config
+
+	err = yaml.Unmarshal(data, &cfg)
+	if err != nil {
+		log.Fatal("cannot parse yaml:", err)
+	}
+
+	return cfg
+}
 
 func nextBackend() string {
 
@@ -102,7 +124,7 @@ func handler(w http.ResponseWriter, r *http.Request) {
 
 		backend := nextBackend()
 
-		url := fmt.Sprintf("%s/?id=%s", backend, id)
+		url := fmt.Sprintf("http://%s/?id=%s", backend, id)
 
 		resp, err := client.Get(url)
 
@@ -133,18 +155,18 @@ func handler(w http.ResponseWriter, r *http.Request) {
 
 func main() {
 
-	flag.IntVar(&port, "port", 80, "server port")
-	flag.StringVar(&backends, "backends", "", "backend list comma separated")
 	flag.IntVar(&timeout, "timeout", 2000, "timeout ms")
 	flag.IntVar(&cacheTTL, "cache-ttl", 10, "cache ttl seconds")
 
 	flag.Parse()
 
-	if backends == "" {
-		log.Fatal("no backends defined")
+	cfg := loadConfig("config.yaml")
+
+	if len(cfg.Servers) == 0 {
+		log.Fatal("no servers defined in config.yaml")
 	}
 
-	backendList = strings.Split(backends, ",")
+	backendList = cfg.Servers
 
 	http.HandleFunc("/", handler)
 
