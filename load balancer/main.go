@@ -7,23 +7,19 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sort"
 	"sync"
 	"time"
 
 	"gopkg.in/yaml.v3"
 )
 
-type CacheEntry struct {
-	body      []byte
-	expiresAt time.Time
-}
-
 type Config struct {
 	Servers []string `yaml:"servers"`
 }
 
 var (
-	port     = 8080
+	port     = 80
 	timeout  int
 	cacheTTL int
 )
@@ -32,8 +28,13 @@ var backendList []string
 var backendIndex int
 var backendMu sync.Mutex
 
-var cache = map[string]CacheEntry{}
-var cacheMu sync.Mutex
+type BackendStat struct {
+	latency   time.Duration
+	expiresAt time.Time
+}
+
+var backendStats = map[string]BackendStat{}
+var backendStatsMu sync.Mutex
 
 func loadConfig(path string) Config {
 
@@ -63,33 +64,40 @@ func nextBackend() string {
 	return b
 }
 
-func getCache(key string) ([]byte, bool) {
+func getBackendLatency(backend string) (time.Duration, bool) {
+	backendStatsMu.Lock()
+	defer backendStatsMu.Unlock()
 
-	cacheMu.Lock()
-	defer cacheMu.Unlock()
-
-	entry, ok := cache[key]
-
+	stat, ok := backendStats[backend]
 	if !ok {
-		return nil, false
+		return 0, false
 	}
 
-	if time.Now().After(entry.expiresAt) {
-		delete(cache, key)
-		return nil, false
+	if time.Now().After(stat.expiresAt) {
+		delete(backendStats, backend)
+		return 0, false
 	}
 
-	return entry.body, true
+	return stat.latency, true
 }
 
-func setCache(key string, body []byte) {
+func setBackendLatency(backend string, latency time.Duration) {
+	backendStatsMu.Lock()
+	defer backendStatsMu.Unlock()
 
-	cacheMu.Lock()
-	defer cacheMu.Unlock()
-
-	cache[key] = CacheEntry{
-		body:      body,
+	backendStats[backend] = BackendStat{
+		latency:   latency,
 		expiresAt: time.Now().Add(time.Duration(cacheTTL) * time.Second),
+	}
+}
+
+func printBackendStats() {
+	backendStatsMu.Lock()
+	defer backendStatsMu.Unlock()
+
+	log.Println("backend latency cache:")
+	for backend, stat := range backendStats {
+		log.Println(backend, stat.latency, "expiresAt", stat.expiresAt)
 	}
 }
 
@@ -102,29 +110,37 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	key := id
-
-	if body, ok := getCache(key); ok {
-
-		log.Println("cache hit id=", id)
-
-		w.Header().Set("Content-Type", "text/html")
-		w.Write(body)
-
-		return
-	}
-
-	log.Println("cache miss id=", id)
+	printBackendStats()
 
 	client := http.Client{
 		Timeout: time.Duration(timeout) * time.Millisecond,
 	}
 
-	for i := 0; i < len(backendList); i++ {
+	backends := make([]string, len(backendList))
+	copy(backends, backendList)
 
-		backend := nextBackend()
+	sort.Slice(backends, func(i, j int) bool {
+		li, oki := getBackendLatency(backends[i])
+		lj, okj := getBackendLatency(backends[j])
+
+		if !oki {
+			li = time.Hour
+		}
+
+		if !okj {
+			lj = time.Hour
+		}
+
+		return li < lj
+	})
+
+	for i := 0; i < len(backends); i++ {
+
+		backend := backends[i]
 
 		url := fmt.Sprintf("http://%s/?id=%s", backend, id)
+
+		start := time.Now()
 
 		resp, err := client.Get(url)
 
@@ -140,7 +156,8 @@ func handler(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		setCache(key, body)
+		latency := time.Since(start)
+		setBackendLatency(backend, latency)
 
 		w.Header().Set("Content-Type", "text/html")
 		w.Write(body)
@@ -167,6 +184,36 @@ func main() {
 	}
 
 	backendList = cfg.Servers
+
+	client := http.Client{
+		Timeout: time.Duration(timeout) * time.Millisecond,
+	}
+
+	for _, backend := range backendList {
+		url := fmt.Sprintf("http://%s/?id=warmup", backend)
+
+		start := time.Now()
+
+		resp, err := client.Get(url)
+
+		if err != nil {
+			log.Println("backend warmup error:", backend, err)
+			continue
+		}
+
+		_, err = io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		if err != nil {
+			log.Println("backend warmup read error:", backend, err)
+			continue
+		}
+
+		latency := time.Since(start)
+		setBackendLatency(backend, latency)
+
+		log.Println("backend warmup success:", backend, latency)
+	}
 
 	http.HandleFunc("/", handler)
 
