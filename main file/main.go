@@ -133,7 +133,7 @@ func handler(w http.ResponseWriter, r *http.Request) {
 
 func main() {
 
-	flag.IntVar(&port, "port", 8080, "server port")
+	flag.IntVar(&port, "port", 80, "server port")
 	flag.StringVar(&backends, "backends", "", "backend list comma separated")
 	flag.IntVar(&timeout, "timeout", 2000, "timeout ms")
 	flag.IntVar(&cacheTTL, "cache-ttl", 10, "cache ttl seconds")
