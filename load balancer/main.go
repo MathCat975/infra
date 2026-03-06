@@ -1,13 +1,16 @@
 package main
 
 import (
+	"bytes"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -15,7 +18,7 @@ import (
 )
 
 type Config struct {
-	Servers []string `yaml:"servers"`
+	Servers map[string][]string `yaml:"servers"`
 }
 
 var (
@@ -24,9 +27,7 @@ var (
 	cacheTTL int
 )
 
-var backendList []string
-var backendIndex int
-var backendMu sync.Mutex
+var servers map[string][]string
 
 type BackendStat struct {
 	latency   time.Duration
@@ -105,16 +106,71 @@ func handler(w http.ResponseWriter, r *http.Request) {
 
 	printBackendStats()
 
+	if len(servers) == 0 {
+		http.Error(w, "no backends configured", http.StatusInternalServerError)
+		return
+	}
+
+	if r.URL.Path == "/" {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+
+		keys := make([]string, 0, len(servers))
+		for name := range servers {
+			keys = append(keys, name)
+		}
+		sort.Strings(keys)
+
+		fmt.Fprintln(w, "<html><head><title>Applications</title></head><body>")
+		fmt.Fprintln(w, "<h1>Applications</h1>")
+		fmt.Fprintln(w, "<ul>")
+		for _, name := range keys {
+			fmt.Fprintf(w, `<li><a href="/%s/">%s</a></li>`+"\n", name, name)
+		}
+		fmt.Fprintln(w, "</ul>")
+		fmt.Fprintln(w, "</body></html>")
+		return
+	}
+
 	client := http.Client{
 		Timeout: time.Duration(timeout) * time.Millisecond,
 	}
 
-	backends := make([]string, len(backendList))
-	copy(backends, backendList)
+	path := strings.TrimPrefix(r.URL.Path, "/")
+	parts := strings.SplitN(path, "/", 2)
+	appName := parts[0]
 
-	sort.Slice(backends, func(i, j int) bool {
-		li, oki := getBackendLatency(backends[i])
-		lj, okj := getBackendLatency(backends[j])
+	if appName == "" {
+		http.NotFound(w, r)
+		return
+	}
+
+	backends, ok := servers[appName]
+	if !ok || len(backends) == 0 {
+		http.NotFound(w, r)
+		return
+	}
+
+	restPath := "/"
+	if len(parts) == 2 && parts[1] != "" {
+		restPath += parts[1]
+	}
+
+	var bodyBytes []byte
+	if r.Body != nil {
+		b, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "failed to read request body", http.StatusBadRequest)
+			return
+		}
+		bodyBytes = b
+	}
+
+	backendsCopy := make([]string, len(backends))
+	copy(backendsCopy, backends)
+
+	sort.Slice(backendsCopy, func(i, j int) bool {
+		li, oki := getBackendLatency(backendsCopy[i])
+		lj, okj := getBackendLatency(backendsCopy[j])
 
 		if !oki {
 			li = time.Hour
@@ -127,33 +183,49 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		return li < lj
 	})
 
-	for i := 0; i < len(backends); i++ {
+	for i := 0; i < len(backendsCopy); i++ {
 
-		backend := backends[i]
+		backend := backendsCopy[i]
 
-		url := fmt.Sprintf("http://%s/", backend)
+		u := &url.URL{
+			Scheme:   "http",
+			Host:     backend,
+			Path:     restPath,
+			RawQuery: r.URL.RawQuery,
+		}
 
 		start := time.Now()
 
-		resp, err := client.Get(url)
+		req, err := http.NewRequest(r.Method, u.String(), bytes.NewReader(bodyBytes))
+		if err != nil {
+			log.Println("request creation error:", backend, err)
+			continue
+		}
+		req.Header = r.Header.Clone()
+
+		resp, err := client.Do(req)
 
 		if err != nil {
 			log.Println("backend error:", backend, err)
 			continue
 		}
 
-		body, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
-
-		if err != nil {
-			continue
-		}
-
 		latency := time.Since(start)
 		setBackendLatency(backend, latency)
 
-		w.Header().Set("Content-Type", "text/html")
-		w.Write(body)
+		for k, values := range resp.Header {
+			for _, v := range values {
+				w.Header().Add(k, v)
+			}
+		}
+
+		w.WriteHeader(resp.StatusCode)
+
+		_, err = io.Copy(w, resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			log.Println("response write error:", backend, err)
+		}
 
 		log.Println("served from backend:", backend)
 
@@ -176,36 +248,38 @@ func main() {
 		log.Fatal("no servers defined in config.yaml")
 	}
 
-	backendList = cfg.Servers
+	servers = cfg.Servers
 
 	client := http.Client{
 		Timeout: time.Duration(timeout) * time.Millisecond,
 	}
 
-	for _, backend := range backendList {
-		url := fmt.Sprintf("http://%s/", backend)
+	for _, backendList := range servers {
+		for _, backend := range backendList {
+			u := fmt.Sprintf("http://%s/", backend)
 
-		start := time.Now()
+			start := time.Now()
 
-		resp, err := client.Get(url)
+			resp, err := client.Get(u)
 
-		if err != nil {
-			log.Println("backend warmup error:", backend, err)
-			continue
+			if err != nil {
+				log.Println("backend warmup error:", backend, err)
+				continue
+			}
+
+			_, err = io.ReadAll(resp.Body)
+			resp.Body.Close()
+
+			if err != nil {
+				log.Println("backend warmup read error:", backend, err)
+				continue
+			}
+
+			latency := time.Since(start)
+			setBackendLatency(backend, latency)
+
+			log.Println("backend warmup success:", backend, latency)
 		}
-
-		_, err = io.ReadAll(resp.Body)
-		resp.Body.Close()
-
-		if err != nil {
-			log.Println("backend warmup read error:", backend, err)
-			continue
-		}
-
-		latency := time.Since(start)
-		setBackendLatency(backend, latency)
-
-		log.Println("backend warmup success:", backend, latency)
 	}
 
 	http.HandleFunc("/", handler)
@@ -213,7 +287,7 @@ func main() {
 	addr := fmt.Sprintf(":%d", port)
 
 	log.Println("main server running on", addr)
-	log.Println("backends:", backendList)
+	log.Println("servers:", servers)
 
 	log.Fatal(http.ListenAndServe(addr, nil))
 }
