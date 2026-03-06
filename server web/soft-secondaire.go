@@ -50,14 +50,12 @@ func handlePage(w http.ResponseWriter, r *http.Request) {
 
 	randomDelay()
 
-	id := r.URL.Query().Get("id")
-
 	fmt.Fprintf(w, `
 <html>
 <body>
-<h1>Page %s</h1>
+<h1>Page</h1>
 <p>random value: %d</p>
 </body>
 </html>
-`, id, rand.Intn(10000))
+`, rand.Intn(10000))
 }
