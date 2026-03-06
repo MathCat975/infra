@@ -103,13 +103,6 @@ func printBackendStats() {
 
 func handler(w http.ResponseWriter, r *http.Request) {
 
-	id := r.URL.Query().Get("id")
-
-	if id == "" {
-		http.Error(w, "missing id", 400)
-		return
-	}
-
 	printBackendStats()
 
 	client := http.Client{
@@ -138,7 +131,7 @@ func handler(w http.ResponseWriter, r *http.Request) {
 
 		backend := backends[i]
 
-		url := fmt.Sprintf("http://%s/?id=%s", backend, id)
+		url := fmt.Sprintf("http://%s/", backend)
 
 		start := time.Now()
 
@@ -190,7 +183,7 @@ func main() {
 	}
 
 	for _, backend := range backendList {
-		url := fmt.Sprintf("http://%s/?id=warmup", backend)
+		url := fmt.Sprintf("http://%s/", backend)
 
 		start := time.Now()
 
