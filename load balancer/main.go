@@ -22,7 +22,7 @@ type Config struct {
 }
 
 var (
-	port     = 80
+	port     = 443
 	timeout  int
 	cacheTTL int
 )
@@ -52,17 +52,6 @@ func loadConfig(path string) Config {
 	}
 
 	return cfg
-}
-
-func nextBackend() string {
-
-	backendMu.Lock()
-	defer backendMu.Unlock()
-
-	b := backendList[backendIndex%len(backendList)]
-	backendIndex++
-
-	return b
 }
 
 func getBackendLatency(backend string) (time.Duration, bool) {
@@ -289,5 +278,5 @@ func main() {
 	log.Println("main server running on", addr)
 	log.Println("servers:", servers)
 
-	log.Fatal(http.ListenAndServe(addr, nil))
+	log.Fatal(http.ListenAndServeTLS(addr, "cert.pem", "key.pem", nil))
 }
